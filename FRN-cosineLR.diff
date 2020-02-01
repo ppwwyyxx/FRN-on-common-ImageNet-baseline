@@ -1,0 +1,207 @@
+diff --git i/ImageNet-ResNet-TensorFlow/imagenet-resnet-gn.py w/ImageNet-ResNet-TensorFlow/imagenet-resnet-gn.py
+index fb9307d..54ee340 100755
+--- i/ImageNet-ResNet-TensorFlow/imagenet-resnet-gn.py
++++ w/ImageNet-ResNet-TensorFlow/imagenet-resnet-gn.py
+@@ -17,6 +17,7 @@ from tensorpack.utils.gpu import get_num_gpu
+ from imagenet_utils import (
+     get_imagenet_dataflow, ImageNetModel,
+     eval_on_ILSVRC12)
++import resnet_model
+ from resnet_model import (
+     resnet_group, resnet_bottleneck, resnet_backbone)
+ 
+@@ -29,28 +30,10 @@ class Model(ImageNetModel):
+ 
+     depth = 50
+ 
+-    use_WS = False
+-    """
+-    Whether to use Centered Weight Normalization
+-    (http://openaccess.thecvf.com/content_ICCV_2017/papers/Huang_Centered_Weight_Normalization_ICCV_2017_paper.pdf),
+-    or Weight Standardization (https://arxiv.org/abs/1903.10520)
+-    """
+-
+     def get_logits(self, image):
+-
+-        def weight_standardization(v):
+-            if not self.use_WS:
+-                return v
+-            if (not v.name.endswith('/W:0')) or v.shape.ndims != 4:
+-                return v
+-            mean, var = tf.nn.moments(v, [0, 1, 2], keep_dims=True)
+-            v = (v - mean) / (tf.sqrt(var)+ 1e-5)
+-            return v
+-
+         num_blocks = {50: [3, 4, 6, 3], 101: [3, 4, 23, 3]}[self.depth]
+         block_func = resnet_bottleneck
+-        with argscope([Conv2D, MaxPooling, GlobalAvgPooling], data_format=self.data_format), \
+-                varreplace.remap_variables(weight_standardization):
++        with argscope([Conv2D, BatchNorm, MaxPooling, GlobalAvgPooling], data_format=self.data_format):
+             return resnet_backbone(
+                 image, num_blocks, resnet_group, block_func)
+ 
+@@ -78,17 +61,13 @@ def get_config(model, fake=False):
+         callbacks = [
+             ModelSaver(),
+             EstimatedTimeLeft(),
+-            GPUUtilizationTracker(),
+-            ScheduledHyperParamSetter(
+-                'learning_rate', [(0, BASE_LR), (30, BASE_LR * 1e-1), (60, BASE_LR * 1e-2),
+-                                  (90, BASE_LR * 1e-3)]),
++            GPUUtilizationTracker()
+         ]
+-        if BASE_LR > 0.1:
++        if not args.cosine_lr:
+             callbacks.append(
+                 ScheduledHyperParamSetter(
+-                    'learning_rate', [(0, 0.1), (5 * steps_per_epoch, BASE_LR)],
+-                    interp='linear', step_based=True))
+-
++                    'learning_rate', [(0, BASE_LR), (30, BASE_LR * 1e-1), (60, BASE_LR * 1e-2),
++                                      (90, BASE_LR * 1e-3)]))
+         infs = [ClassificationError('wrong-top1', 'val-error-top1'),
+                 ClassificationError('wrong-top5', 'val-error-top5')]
+         if nr_tower == 1:
+@@ -116,13 +95,21 @@ if __name__ == '__main__':
+     parser.add_argument('--eval', action='store_true')
+     parser.add_argument('--batch', default=256, type=int, help='total batch size.')
+     parser.add_argument('-d', '--depth', type=int, default=50, choices=[50, 101])
+-    parser.add_argument('--logdir', default='train_log/ResNet-GN')
+-    parser.add_argument('--WS', action='store_true', help='Use Weight Standardization')
++    parser.add_argument('--logdir', default='train_log/ResNet')
++    parser.add_argument('--frn-trelu', action='store_true')
++    parser.add_argument('--cosine-lr', action='store_true')
+     args = parser.parse_args()
+ 
++    if args.frn_trelu:
++        resnet_model.NORM = resnet_model.FRN
++        resnet_model.ACT = resnet_model.TReLU
++    else:
++        # default to BN + ReLU
++        pass
++
+     model = Model()
+     model.depth = args.depth
+-    model.use_WS = args.WS
++    model.cosine_lr = args.cosine_lr
+     if args.eval:
+         batch = 128    # something that can run on one gpu
+         ds = get_imagenet_dataflow(args.data, 'val', batch)
+diff --git i/ImageNet-ResNet-TensorFlow/imagenet_utils.py w/ImageNet-ResNet-TensorFlow/imagenet_utils.py
+index 1af42c5..831b3b4 100644
+--- i/ImageNet-ResNet-TensorFlow/imagenet_utils.py
++++ w/ImageNet-ResNet-TensorFlow/imagenet_utils.py
+@@ -204,7 +204,16 @@ class ImageNetModel(ModelDesc):
+         """
+ 
+     def optimizer(self):
+-        lr = tf.get_variable('learning_rate', initializer=0.1, trainable=False)
++        if not self.cosine_lr:
++            lr = tf.get_variable('learning_rate', initializer=0.1, trainable=False)
++            # will be changed by the callback
++        else:
++            print("Using Cosine")
++            gs = tf.train.get_or_create_global_step()
++            total_steps = 1281167 // 256 * 100
++            BASE_LR = 0.1
++            lr = BASE_LR * 0.5 * (1 + tf.cos(gs / total_steps * np.pi))
++
+         tf.summary.scalar('learning_rate-summary', lr)
+         return tf.train.MomentumOptimizer(lr, 0.9, use_nesterov=True)
+ 
+diff --git i/ImageNet-ResNet-TensorFlow/resnet_model.py w/ImageNet-ResNet-TensorFlow/resnet_model.py
+index 71a770e..0211e09 100644
+--- i/ImageNet-ResNet-TensorFlow/resnet_model.py
++++ w/ImageNet-ResNet-TensorFlow/resnet_model.py
+@@ -45,9 +45,38 @@ def GroupNorm(x, group=32, gamma_initializer=tf.constant_initializer(1.)):
+     return tf.reshape(out, orig_shape, name='output')
+ 
+ 
+-def GNReLU(x, name=None):
+-    x = GroupNorm('gn', x)
+-    return tf.nn.relu(x, name=name)
++@layer_register(log_shape=True)
++def FRN(x, gamma_initializer=tf.constant_initializer(1.)):
++    print("Using FRN on ", x.name)
++    shape = x.get_shape().as_list()
++    nu2 = tf.reduce_mean(tf.square(x), axis=[2, 3], keepdims=True)
++    x = x * tf.rsqrt(nu2 + tf.abs(1e-6))
++    chan = shape[1]
++    new_shape = [1, chan, 1, 1]
++    gamma = tf.get_variable('gamma', [chan], initializer=gamma_initializer)
++    gamma = tf.reshape(gamma, new_shape)
++    beta = tf.get_variable('beta', [chan], initializer=tf.constant_initializer())
++    beta = tf.reshape(beta, new_shape)
++    return x * gamma + beta
++
++
++def TReLU(x, name=None):
++    print("Using TReLU on ", x.name)
++    shape = x.get_shape().as_list()
++    chan = shape[1]
++    new_shape = [1, chan, 1, 1]
++    tau = tf.get_variable('tau', [chan], initializer=tf.constant_initializer())
++    tau = tf.reshape(tau, new_shape)
++    return tf.maximum(x, tau)
++
++
++def NormAct(x, name=None):
++    x = NORM(name or 'norm', x)
++    return ACT(x)
++
++
++NORM = BatchNorm
++ACT = tf.nn.relu
+ 
+ 
+ def resnet_shortcut(l, n_out, stride, activation=tf.identity):
+@@ -58,14 +87,14 @@ def resnet_shortcut(l, n_out, stride, activation=tf.identity):
+         return l
+ 
+ 
+-def get_gn(zero_init=False):
++def get_norm(zero_init=False):
+     """
+     Zero init gamma is good for resnet. See https://arxiv.org/abs/1706.02677.
+     """
+     if zero_init:
+-        return lambda x, name=None: GroupNorm('gn', x, gamma_initializer=tf.zeros_initializer())
++        return lambda x, name=None: NORM('norm', x, gamma_initializer=tf.zeros_initializer())
+     else:
+-        return lambda x, name=None: GroupNorm('gn', x)
++        return lambda x, name=None: NORM('norm', x)
+ 
+ 
+ def resnet_bottleneck(l, ch_out, stride, stride_first=False):
+@@ -73,16 +102,16 @@ def resnet_bottleneck(l, ch_out, stride, stride_first=False):
+     stride_first: original resnet put stride on first conv. fb.resnet.torch put stride on second conv.
+     """
+     shortcut = l
+-    l = Conv2D('conv1', l, ch_out, 1, strides=stride if stride_first else 1, activation=GNReLU)
++    l = Conv2D('conv1', l, ch_out, 1, strides=stride if stride_first else 1, activation=NormAct)
+     if stride == 1:
+-        l = Conv2D('conv2', l, ch_out, 3, strides=1 if stride_first else stride, activation=GNReLU)
++        l = Conv2D('conv2', l, ch_out, 3, strides=1 if stride_first else stride, activation=NormAct)
+     else:
+         l = tf.pad(l, [[0, 0], [0, 0], [1, 1], [1, 1]])
+         l = Conv2D('conv2', l, ch_out, 3, strides=1 if stride_first else
+-                   stride, activation=GNReLU, padding='VALID')
+-    l = Conv2D('conv3', l, ch_out * 4, 1, activation=get_gn(zero_init=True))
+-    return tf.nn.relu(l +
+-        resnet_shortcut(shortcut, ch_out * 4, stride, activation=get_gn(zero_init=False)))
++                   stride, activation=NormAct, padding='VALID')
++    l = Conv2D('conv3', l, ch_out * 4, 1, activation=get_norm(zero_init=True))
++    return ACT(l +
++        resnet_shortcut(shortcut, ch_out * 4, stride, activation=get_norm(zero_init=False)))
+ 
+ def resnet_group(l, name, block_func, features, count, stride):
+     with tf.variable_scope(name):
+@@ -98,7 +127,7 @@ def resnet_backbone(image, num_blocks, group_func, block_func):
+                       scale=2.0, mode='fan_out', distribution='untruncated_normal')):
+         logits = (LinearWrap(image)
+                   .tf.pad([[0, 0], [0, 0], [3, 3], [3, 3]])
+-                  .Conv2D('conv0', 64, 7, strides=2, activation=GNReLU, padding='VALID')
++                  .Conv2D('conv0', 64, 7, strides=2, activation=NormAct, padding='VALID')
+                   .tf.pad([[0, 0], [0, 0], [1, 1], [1, 1]])
+                   .MaxPooling('pool0', shape=3, stride=2, padding='VALID')
+                   .apply(group_func, 'group0', block_func, 64, num_blocks[0], 1)
