@@ -1,3 +1,4 @@
+## Train common ImageNet baselines with Filter Response Normalization
 
 We apply the recent [Filter Response Normalization](https://arxiv.org/abs/1911.09737)
 method on a better and common training recipe of ResNet-50 on ImageNet,
